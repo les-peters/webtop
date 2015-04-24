@@ -1,0 +1,1208 @@
+#!/usr/bin/perl -s
+
+# webtop: web traffic analyzer (based on dnstop)
+
+my $version = "1.12.0";
+
+# Change log
+#
+# 1.0: initial release 2011-08-12
+#   provides view of source and destination IP addresses
+#            GET content
+#            Host, UserAgent, and Referer headers
+#
+# 1.1: feature release 2011-08-29
+#   change default refresh rate to 1 second
+#   augments field width
+#   augments views to include source->header/content
+#   added Berkeley filter
+#
+# 1.2: feature release 2011-11-01
+#   added language view
+#   added GeoIP view (via fixed CSV files)
+#   added AS Path view (via fixed CSV files)
+#
+# 1.3: feature release 2011-11-25
+#   added HTTP filtering (F)
+#   moved DBM files to admin subdirectory in user's home
+#
+# 1.4: reworked display/keyboard read routines to function within packet loop
+#
+# 1.5: optimized GeoIP and AS Path search logic
+#
+# 1.6: added non-interactive reporting to file or STDOUT
+#      -c=#### packets
+#      -t=###m time
+#      -o output to STDOUT
+#      -o=file output to file
+#      -of=views to print out
+#
+# 1.7: added multiple pcap file processing
+#
+# 1.8: fixed mid-execution filter changing
+#      cleaned up variable names for publishing
+#      removed -b as an alias for -f
+#      added HTTP version info to get view 
+#      added BPS/PPS calculations
+#      added pause feature
+#      fixed refresh rate feature
+#
+# 1.9: bug/feature release 2012-06-12
+#      fixed destination BPS bug
+#      improved variable names
+#      added support for use of -i, to match tcpdump
+#      added failsafe for BPF typos
+#      added warning about use of -i without =
+#
+# 1.10: feature release 2012-10-12
+#       expanded values for GET/POST request string
+#       added --clear option to remove old DBM files
+#       added open source license statement
+#       removed X-Forwarded-For code
+#
+# 1.11: feature release 2012-12-12
+#       added (m/M) heatmap of PPS/BPS activity over all /10's
+#       added (q) to quit (rather than Ctrl-C)
+#       added (o) overall view (minimized view of Hosts, GETs/POSTs, User-Agents, and Referers
+#
+# 1.11.1: fixed DIVZERO errors
+#
+# 1.11.2: fixed overall view
+#         added overall view to help
+#
+# 1.12.0: post-N*
+
+use Net::Pcap;
+use Time::HiRes qw(usleep);
+use Term::ReadKey;
+use Cwd;
+use Sys::Hostname;
+
+# debug
+use Data::Dumper;
+
+my $license = qq{
+
+Copyright (c) 2011-2012 Neustar, Inc.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+* Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+* Neither the name of Neustar nor the names of its contributors may
+be used to endorse or promote products derived from this software without
+specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+};
+
+my $packet_filter;
+my $error_message;
+my $pause_switch           = 0;
+
+my @dbm_files = qw(src_dst_data  src_data          dst_data 
+                   geoip_data    src_geoip_data    dst_geoip_data 
+                   host_data     src_host_data     dst_host_data
+                   get_data      src_get_data      dst_get_data
+                   language_data src_language_data dst_language_data
+                   agent_data    src_agent_data    dst_agent_data
+                   referer_data  src_referer_data  dst_referer_data
+                                 src_bps           dst_bps
+                                 src_pps           dst_pps
+                   as_data
+                   non_compliant_data
+                   heatmap_bps heatmap_pps
+);
+
+# evaluate command line arguments
+
+my $command_help_option = $h;
+if ($command_help_option) {
+    &view_command_help;
+    exit 0;
+}
+
+print "clearing data files...";
+
+# create admin directory for DBM files
+if (! -d "$ENV{'HOME'}/.webtop") {
+    mkdir "$ENV{'HOME'}/.webtop" or die;
+}
+chdir("$ENV{'HOME'}/.webtop") or die;
+
+# clear old DBM files
+for my $dbm_file (@dbm_files) {
+    unlink($dbm_file) if -f $dbm_file;
+}
+
+my $transaction_limit_option = $c;
+my $berkeley_filter_option   = $f || $b || '';
+my $multiple_file_option     = $m;
+my $input_option             = $i;
+if ($input_option == "1") { 
+    $input_option = ""; 
+    print STDERR "Warning: use of '-i' without '=' detected...\n";
+    sleep 1;
+}
+my $output_option            = $o;
+my $refresh_rate_option      = $r;  
+my $timed_option             = $t;
+my $view_option              = $v;
+my $http_filter_option       = $F; 
+my $output_format_option     = $of; 
+my $output_length_option     = $ol; 
+
+my ($device_name_or_file_name, @packet_capture_files);
+if ($multiple_file_option) {
+    if (! $output_option) {
+        print STDERR "output destination not provided; assuming STDOUT\n";
+        $output_option=1;
+    }
+    @packet_capture_files = split(/[, ]/,$input_option) || @ARGV;
+} else {
+    $device_name_or_file_name = $input_option || $ARGV[0];
+    if ($output_option) {
+        if (! $transaction_limit_option && ! $timed_option) {
+            print STDERR "must define either packet count (-c) ",
+                         "or time to measure (-t)\n";
+            exit 1;
+        }
+        if ($transaction_limit_option && $timed_option) {
+            print STDERR "may define either packet count (-c) ",
+                         "or time to measure (-t), not both\n";
+            exit 1;
+        }
+    } else {
+        if ($transaction_limit_option || $timed_option) {
+            print STDERR "cannot use packet count (-c) ",
+                         "or time to measure (-t) ",
+                         "without output option (-o)\n";
+            exit 1;
+        }
+    }
+}
+
+if (! $device_name_or_file_name && scalar @packet_capture_files == 0) {
+    print STDERR "must supply either a device name or file(s) to read\n";
+    exit 1;
+}
+
+$output_format_option ||= 's,h,r,a,g';
+$output_length_option ||= 50;
+
+$transaction_count       = 0;
+$total_transaction_count = 0;
+$packet_count            = 0;
+$total_packet_count      = 0;
+
+# default refresh rate is 1 seconds
+$refresh_rate_option     ||= 1;
+$refresh_countdown_timer   = $refresh_rate_option;
+
+# establish hash for control key commands in interactive mode
+$control_keys = {
+    '1'  => 'da',
+    '7'  => 'dg',
+    '8'  => 'dh',
+    '12' => 'dl',
+    '18' => 'dr',
+};
+
+my $command_hashref  = {};
+
+# default view is Host
+if (defined($view_option)) {
+    $command_hashref->{$view_option}++;
+} else {
+    $command_hashref->{'h'}++;
+}
+
+# read GeoIP CSV data
+
+my @geographic_IP_keys;
+my %geographic_IP_region_hash;
+my %geographic_IP_region_data;
+if (open(GEOIP, '<', '/usr/local/data/GeoIPCountryWhois.csv')) {
+    while(<GEOIP>) {
+        chomp;
+        ($start_IP_address,   $end_IP_address, 
+         $start_IP_integer,   $end_IP_integer, 
+         $two_letter_acronym, $geographic_region) = split(',',$_,6);
+        for ($start_IP_address,   $end_IP_address,
+             $start_IP_integer,   $end_IP_integer,  
+             $two_letter_acronym, $geographic_region) {
+            s/"//g;
+        }
+        $geographic_IP_region_hash{$start_IP_integer}  = $end_IP_integer;
+        $geographic_IP_region_data{$start_IP_integer} = "$two_letter_acronym: $geographic_region";
+    }
+    close(GEOIP);
+    @geographic_IP_keys = sort { $a <=> $b } keys %geographic_IP_region_hash;
+}
+
+# read AS CSV data
+
+my @autonomous_system_keys;
+my %autonomous_system_name_hash;
+my %autonomous_system_name_data;
+if (open(AS, '<', '/usr/local/data/GeoIPASNum2.csv')) {
+    while(<AS>) {
+        chomp;
+        my ($start_IP_integer, $end_IP_integer, $autonomous_system_name) = split(',', $_, 3);
+        for ($start_IP_integer, $end_IP_integer, $autonomous_system_name) {
+            s/"//g;
+        }
+        $autonomous_system_name_hash{$start_IP_integer} = $end_IP_integer;
+        $autonomous_system_name_data{$start_IP_integer} = $autonomous_system_name;
+    } 
+    close(AS);
+    @autonomous_system_keys = sort { $a <=> $b } keys %autonomous_system_name_data;
+}
+
+&clear_DBM_data_files();
+
+$transaction_count          = 0;
+$total_transaction_count    = 0;
+$packet_count               = 0;
+$total_packet_count         = 0;
+$previous_packet_time_value = 0;
+
+my $net_pcap_object;
+if ($multiple_file_option) {
+    for my $packet_capture_file (@packet_capture_files) {
+        my $old_berkeley_filter_value = '';
+        $net_pcap_object = &open_file_or_dev($packet_capture_file);
+
+        Net::Pcap::compile(
+            $net_pcap_object, 
+            \$packet_filter, 
+            $berkeley_filter_option,
+            0, 
+            $netmask
+        ) && &revert_berkeley_packet_filter($old_berkeley_filter_value);
+
+        Net::Pcap::setfilter($net_pcap_object, $packet_filter) &&
+            die 'Unable to set packet capture filter';
+        Net::Pcap::loop($net_pcap_object, -1, \&process_packet_data, '');
+        Net::Pcap::close($net_pcap_object);
+    }
+    &output_report;
+    exit;
+} else {
+
+    my $old_berkeley_filter_value = '';
+    # Create packet capture object on device
+    $net_pcap_object = &open_file_or_dev($device_name_or_file_name);
+
+    Net::Pcap::compile(
+        $net_pcap_object, 
+        \$packet_filter, 
+        $berkeley_filter_option,
+        0, 
+        $netmask
+    ) && &revert_berkeley_packet_filter($old_berkeley_filter_value);
+
+    Net::Pcap::setfilter($net_pcap_object, $packet_filter) &&
+        die 'Unable to set packet capture filter';
+
+    # run loop under a specific packet count
+    if ($transaction_limit_option) {
+        my $transaction_limit;
+        if ($transaction_limit_option =~ /(\d+)k$/i) {
+            $transaction_limit = $1 * 1000;
+        } elsif ($transaction_limit_option =~ /(\d+)m$/i) {
+            $transaction_limit = $1 * 1000000;
+        } else {
+            $transaction_limit = $transaction_limit_option;
+        }
+        Net::Pcap::loop($net_pcap_object, $transaction_limit, \&process_packet_data, '');
+        Net::Pcap::close($net_pcap_object);
+        &output_report($device_name_or_file_name);
+    } elsif ($timed_option) {
+        # run loop under an timed alarm 
+        my $timer_duration;
+        if ($timed_option =~ /(\d+)m/) {
+            $timer_duration = $1 * 60;
+        } elsif ($timed_option =~ /(\d+)h/) {
+            $timer_duration = $1 * 60 * 60;
+        } else {
+            $timer_duration = $timed_option;
+        }
+        eval {
+            local $SIG{ALRM} = sub {
+                Net::Pcap::close($net_pcap_object);
+                &output_report($device_name_or_file_name);
+                exit;
+            };
+            alarm($timer_duration);
+            Net::Pcap::loop($net_pcap_object, -1, \&process_packet_data, '');
+        };
+        alarm(0);
+        exit;
+    } else {
+        ReadMode 3;
+        Net::Pcap::loop($net_pcap_object, -1, \&process_packet_data, '');
+        Net::Pcap::close($net_pcap_object);
+        ReadMode 0;
+    }
+}
+
+sub open_file_or_dev {
+    my $device_name_or_file_name = shift;
+    # Create packet capture object on device
+    if ($device_name_or_file_name =~ /^[\.\/]/) {
+        $net_pcap_object = Net::Pcap::open_offline($device_name_or_file_name, \$error_message);
+    } else {
+        $net_pcap_object = Net::Pcap::open_live($device_name_or_file_name, 65535, 0, 0, \$error_message);
+    }
+    unless (defined $net_pcap_object) {
+        die 'Unable to create packet capture on device ', $device_name_or_file_name, ' - ', $error_message;
+    }
+    return $net_pcap_object;
+}
+
+sub output_report {
+    my $device_name_or_file_name = shift;
+    if ($output_option != 1) { 
+        open(REPORT, '>', "$output_option") || die;
+        select(REPORT);
+    }
+    print "Webtop report: ", scalar localtime, "\n";
+    print "System: ", hostname();
+    print "; Data Source: $device_name_or_file_name" if $device_name_or_file_name;
+    print "; BPF: $berkeley_filter_option"           if $berkeley_filter_option;
+    print "; HTTP Filter: $http_filter_option"       if $http_filter_option;
+    print "\n\n";
+    for my $output_format (split(/,/,$output_format_option)) {
+        my @output_header = &display_header(80, $output_format);
+        my @output_array  = &output_hash($output_length_option + 5, 80, $output_format);  
+        print join("\n", @output_header);
+        print "\n";
+        print join("\n", @output_array);
+    }
+    if ($output_option) {
+        close(REPORT);
+    }
+    return;
+}
+
+sub process_packet_data {
+    my ($user_data, 
+        $header_data, 
+        $packet_data) = @_;
+    my ($src_IP_data_offset) = 26; # start of the source IP in the packet
+    my ($dst_IP_data_offset) = 30; # start of the dest IP in the packet
+    my ($domain_offset)      = 54; # start of the domain in the packet
+
+    my $packet_length = $header_data->{'len'} * 8;
+    my $payload_data;
+
+    # insert time delay when reading a file, or write live output (web mode)
+    if (! $output_option && ! $multiple_file_option) {
+        if (! $previous_packet_time_value) {
+            $previous_packet_time_value = $header_data->{'tv_sec'};
+        }
+        if ($previous_packet_time_value < $header_data->{'tv_sec'}) {
+            $previous_packet_time_value = $header_data->{'tv_sec'};
+            $refresh_countdown_timer--;
+            if ($refresh_countdown_timer == 0) {
+                &refresh_screen() unless $pause_switch;
+                $refresh_countdown_timer = $refresh_rate_option;
+            }
+            &clear_bps_pps_data();
+            &keycmd;
+            if ($device_name_or_file_name =~ /^[\.\/]/) {
+                sleep 1;
+                return;
+            }
+        }
+    }
+
+    # extract the source IP addr into dotted quad form.
+    my($src_IP_string) = sprintf("%d.%d.%d.%d",
+        ord( substr($packet_data, $src_IP_data_offset,     1) ),
+        ord( substr($packet_data, $src_IP_data_offset + 1, 1) ),
+        ord( substr($packet_data, $src_IP_data_offset + 2, 1) ),
+        ord( substr($packet_data, $src_IP_data_offset + 3, 1) ));
+    
+    # generate key for heatmap data
+    my $src_first_octet  = sprintf("%d", 
+                                   ord( substr($packet_data, $src_IP_data_offset,     1) ));
+    my $src_second_octet = sprintf("%d", 
+                                   ord( substr($packet_data, $src_IP_data_offset + 1, 1) ));
+    my $src_heatmap_key;
+    if ($src_second_octet < 64) {
+        $src_heatmap_key = $src_first_octet . ".0";
+    } elsif ($src_second_octet < 128) {
+        $src_heatmap_key = $src_first_octet . ".64";
+    } elsif ($src_second_octet < 192) {
+        $src_heatmap_key = $src_first_octet . ".128";
+    } else {
+        $src_heatmap_key = $src_first_octet . ".192";
+    }
+
+    # determine geoIP location of source IP
+    my @src_IP_octets = split(/\./, $src_IP_string);
+    my $src_IP_integer = ($src_IP_octets[0] * 256 * 256 * 256)
+                       + ($src_IP_octets[1] * 256 * 256)
+                       + ($src_IP_octets[2] * 256)
+                       +  $src_IP_octets[3];
+
+    # extract the destination IP addr into dotted quad form.
+    my ($dst_IP_string) = sprintf("%d.%d.%d.%d",
+        ord( substr($packet_data, $dst_IP_data_offset,     1) ),
+        ord( substr($packet_data, $dst_IP_data_offset + 1, 1) ),
+        ord( substr($packet_data, $dst_IP_data_offset + 2, 1) ),
+        ord( substr($packet_data, $dst_IP_data_offset + 3, 1) ));
+
+    $payload_data = substr($packet_data, $domain_offset);
+
+    # change the domain component separators back into dots.
+    $payload_data =~ s/[^ -~]/./g;    
+
+    # HTTP header filter
+    if ($http_filter_option && $payload_data !~ /$http_filter_option/) {
+        return;
+    }
+    if ($src_IP_string and $dst_IP_string and $payload_data) {
+        my $search_IP_integer = $src_IP_integer;
+
+        my $src_geographic_array_index =  &binary_search_data(\@geographic_IP_keys, $search_IP_integer);
+        my $src_country;
+        if ( $search_IP_integer <= $geographic_IP_region_hash{ $geographic_IP_keys[$src_geographic_array_index] } ) {
+            $src_geographic_string       =  $geographic_IP_region_data{ $geographic_IP_keys[$src_geographic_array_index] };
+        } else {
+            $src_geographic_string       =  'ZZ: No known GeoIP';
+        }
+
+        my $src_autonomous_system_index =  &binary_search_data(\@autonomous_system_keys, $search_IP_integer);
+        my $src_IP_autonomous_system_name;
+        if ($search_IP_integer <= $autonomous_system_name_hash{ $autonomous_system_keys[$src_autonomous_system_index] }) {
+            $src_IP_autonomous_system_name       =  $autonomous_system_name_data{ $autonomous_system_keys[$src_autonomous_system_index] };
+        } else {
+            $src_IP_autonomous_system_name       =  'AS0: No known AS';
+        }
+
+        $Src_BPS{$src_IP_string}       += $packet_length / $refresh_rate_option;
+        $Dst_BPS{$dst_IP_string}       += $packet_length / $refresh_rate_option;
+        $Src_PPS{$src_IP_string}       += 1              / $refresh_rate_option;
+        $Dst_PPS{$dst_IP_string}       += 1              / $refresh_rate_option;
+        $Heatmap_PPS{$src_heatmap_key} += 1              / $refresh_rate_option;
+        $Heatmap_BPS{$src_heatmap_key} += $packet_length / $refresh_rate_option;
+        if ($payload_data =~ /((GET|POST)\s\S+\s+HTTP\/\d\.\d)/) {
+            $get_match = "$1";
+            $get_match =~ s/\.\.$//;    
+            $Src_Data{$src_IP_string}++;
+            $Dst_Data{$dst_IP_string}++;
+            $Src_Dst_Data{$src_IP_string . "##" . $dst_IP_string}++;
+            $GeoIP_Data{$src_geographic_string}++;
+            $Src_GeoIP_Data{$src_IP_string . "##" . $src_geographic_string}++;
+            $Dst_GeoIP_Data{$dst_IP_string . "##" . $src_geographic_string}++;
+            $AS_Data{$src_IP_autonomous_system_name}++;
+            if ($get_match) {
+                $Get_Data{$get_match}++;
+                $Src_Get_Data{$src_IP_string . '##' . $get_match}++;
+                $Dst_Get_Data{$dst_IP_string . '##' . $get_match}++;
+            }
+            if ($payload_data =~ /((?i:Host)):\s(\S+?)\.\./) {
+                my $key = $2;
+                if ($1 !~ /Host/) {
+                    $Non_Compliant_Data{'Host'}++;
+                    $key = "*** $2";
+                }
+                if ($key) {
+                    $Host_Data{$key}++;
+                    $Src_Host_Data{$src_IP_string . '##' . $key}++;
+                    $Dst_Host_Data{$dst_IP_string . '##' . $key}++;
+                }
+            }
+            if ($payload_data =~ /((?i:User-Agent)):\s(.+?)\.\./) {
+                my $key = $2;
+                if ($1 !~ /User-Agent/) {
+                    $Non_Compliant_Data{'User-Agent'}++;
+                    $key = "*** $2";
+                }
+                if ($key) {
+                    $Agent_Data{$key}++;
+                    $Src_Agent_Data{$src_IP_string . '##' . $key}++;
+                    $Dst_Agent_Data{$dst_IP_string . '##' . $key}++;
+                }
+            }
+
+            if ($payload_data =~ /((?i:Accept-Language)):\s(\S+?)\.\./) {
+                my $key = $2;
+                if ($1 !~ /Accept-Language/) {
+                    $Non_Compliant_Data{'Accept-Language'}++;
+                    $key = "*** $2";
+                }
+                if ($key) {
+                    $Language_Data{$key}++;
+                    $Src_Language_Data{$src_IP_string . '##' . $key}++;
+                    $Dst_Language_Data{$dst_IP_string . '##' . $key}++;
+                }
+            }
+
+            if ($payload_data =~ /((?i:Referer)):\s(\S+?)\.\./) {
+                my $key = $2;
+                if ($1 !~ /Referer/) {
+                    $Non_Compliant_Data{'Referer'}++;
+                    $key = "*** $2";
+                }
+                if ($key) {
+                    $Referer_Data{$key}++;
+                    $Src_Referer_Data{$src_IP_string . '##' . $key}++;
+                    $Dst_Referer_Data{$dst_IP_string . '##' . $key}++;
+                }
+            }
+            $transaction_count++;
+            $total_transaction_count++;
+        }
+    }
+    $packet_count++;
+    $total_packet_count++;
+    return;
+}
+
+sub output_hash {
+    my $terminal_length = shift || (GetTerminalSize())[1];
+    my $terminal_width  = shift || (GetTerminalSize())[0];
+    my $data_view       = shift || (keys %$command_hashref)[0];
+    my $data_ref = &set_data_ref($data_view);
+    my $data_ref_sum_string = join('+', values %{$data_ref});
+    my $data_ref_sum = eval $data_ref_sum_string;
+
+    # adapt to populate a output_array, which is returned for later printing
+    my @output_array = ();
+
+    # heatmap
+    if ($data_view =~ /m/i) {
+        my $line_length = 0;
+        my $output_string = "";
+        for my $first_octet (0..255) {
+            for my $second_octet (qw(0 64 128 192)) {
+                my $heatmap_key = $first_octet . "." . $second_octet;
+                my $percentage;
+                if ($data_ref_sum == 0) {
+                    $percentage = 0.0;
+                } else {
+                    $percentage = 100 * ($data_ref->{$heatmap_key} / $data_ref_sum);
+                }
+                if ($line_length == 0) {
+                    $output_string .= sprintf "%3s", $first_octet;
+                }
+                if ($heatmap_key =~ /\.0$/) {
+                    $output_string .= "|";
+                }
+                my $value = sprintf("%.1f", $percentage);
+                # 0.0           -> .
+                # 0.1  .. 0.9   -> 1 .. 9
+                # 1.0  .. 9.9   -> a .. i
+                # 10.0 .. 19.9  -> A
+                # 20.0 .. 29.9  -> B
+                # ...
+                # 80.0 .. 89.9  -> H
+                # 90.0 .. 90.9  -> Q
+                # 91.0 .. 91.9  -> R, etc
+                # 100           -> Z
+                if ($value < 0.1) {
+                    $output_string .= " ";
+                } elsif ($value < 1.0) {
+                    $output_string .= chr(48+10*$value);
+                } elsif ($value < 10.0) {
+                    $output_string .= chr(96+int($value));
+                } elsif ($value < 90.0) {
+                    $output_string .= chr(64+int($value/10));
+                } elsif ($value < 100.0) {
+                    $output_string .= chr(81+int($value - 90));
+                } elsif ($value == 100.0) {
+                    $output_string .= "Z";
+                }
+                $line_length++;
+                if ($line_length == 64) {
+                    push @output_array, "$output_string";
+                    $output_string = "";
+                    $line_length = 0;
+                }
+            } 
+        }
+    } else {
+        my $line_count = 0;
+        for my $data_key (sort { $data_ref->{$b} <=> $data_ref->{$a} } keys %$data_ref) {
+            my $count_display = &SI_notation($data_ref->{$data_key});
+
+            if ($data_key =~ /##/) {
+                ($primary_aggregation_key, $secondary_aggregation_key) = split(/##/, $data_key, 2);
+                if (length($secondary_aggregation_key) > ($terminal_width - 32)) {
+                    $key_output = substr($secondary_aggregation_key, 0, ($terminal_width - 35)) . "...";
+                } else {
+                    $key_output = $secondary_aggregation_key;
+                }
+                if ($data_ref_sum == 0) {
+                    $percentage = 0.0;
+                } else {
+                    $percentage = 100 * ($data_ref->{$data_key} / $data_ref_sum);
+                }
+                push @output_array, sprintf "%-15s  %-*s  %s  %5.1f", 
+                    $primary_aggregation_key,
+                    $terminal_width - 32,
+                    $key_output, 
+                    $count_display,
+                    $percentage;
+            } else {
+                if (length($data_key) > ($terminal_width - 15)) {
+                    $key_output = substr($data_key, 0, ($terminal_width - 18)) . "...";
+                } else {
+                    $key_output = $data_key;
+                }
+                push @output_array, sprintf "%-*s  %s  %5.1f", 
+                    $terminal_width - 15,
+                    $key_output, 
+                    $count_display,
+                    $percentage;
+            }
+            $line_count++;
+            last if $line_count > ($terminal_length - 7);
+        }
+    }
+    undef $data_ref;
+    return @output_array;
+}
+
+sub display_header {
+    my $terminal_width  = shift || (GetTerminalSize())[0];
+    my $data_view = shift || (keys %$command_hashref)[0];
+    my $data_ref = &set_data_ref($data_view);
+    my @output_header = ();
+    my $header_line;
+    if ( $data_view eq 'o'  ) { 
+        $header_line = 'Overall';
+    }
+    if ( $data_view eq 'a'  ) { 
+        $header_line = 'Agents';
+        if ($Non_Compliant_Data{'User-Agent'}) {
+            $header_line .= " *";
+        }
+    }
+    if ( $data_view eq 'e'  ) { 
+        $header_line = 'GeoIP';
+    }
+    if ( $data_view eq 'l'  ) { 
+        $header_line = 'Languages';
+        if ($Non_Compliant_Data{'Accept-Language'}) {
+            $header_line .= " *";
+        }
+    }
+    if ( $data_view eq 'n'  ) { 
+        $header_line = 'AS Path';
+    }
+    if ( $data_view eq 'g'  ) { 
+        $header_line = 'Gets';
+    }
+    if ( $data_view eq 'h'  ) { 
+        $header_line = 'Hosts';
+        if ($Non_Compliant_Data{'Host'}) {
+            $header_line .= " *";
+        }
+    }
+    if ( $data_view eq 'r'  ) { 
+        $header_line = 'Referers';
+        if ($Non_Compliant_Data{'Referer'}) {
+            $header_line .= " *";
+        }
+    }
+    if ( $data_view eq 's'  ) {
+        $header_line = 'Sources';
+    }
+    if ( $data_view eq 'm'  ) {
+        $header_line = 'Heatmap PPS';
+    }
+    if ( $data_view eq 'sm'  ) {
+        $header_line = 'Heatmap BPS';
+    }
+    if ( $data_view eq 'sa' ) {
+        $header_line = 'Source           Agents';
+        if ($Non_Compliant_Data{'User-Agent'}) {
+            $header_line .= " *";
+        }
+    }
+    if ( $data_view eq 'sb' ) {
+        $header_line = 'Source           BPS';
+    }
+    if ( $data_view eq 'sd' ) {
+        $header_line = 'Source           Destinations';
+    }
+    if ( $data_view eq 'sg' ) {
+        $header_line = 'Source           Gets';
+    }
+    if ( $data_view eq 'sh' ) {
+        $header_line = 'Source           Hosts';
+        if ($Non_Compliant_Data{'Host'}) {
+            $header_line .= " *";
+        }
+    }
+    if ( $data_view eq 'sl' ) {
+        $header_line = 'Source           Language';
+        if ($Non_Compliant_Data{'Language'}) {
+            $header_line .= " *";
+        }
+    }
+    if ( $data_view eq 'sp' ) {
+        $header_line = 'Source           PPS';
+    }
+    if ( $data_view eq 'sr' ) {
+        $header_line = 'Source           Referers';
+        if ($Non_Compliant_Data{'Referer'}) {
+            $header_line .= " *";
+        }
+    }
+    if ( $data_view eq 'd'  ) {
+        $header_line = 'Destinations';
+    }
+    if ( $data_view eq 'da' ) {
+        $header_line = 'Destination      Agents';
+        if ($Non_Compliant_Data{'User-Agent'}) {
+            $header_line .= " *";
+        }
+    }
+    if ( $data_view eq 'db' ) {
+        $header_line = 'Destination      BPS';
+    }
+    if ( $data_view eq 'dl' ) {
+        $header_line = 'Destination      Language';
+        if ($Non_Compliant_Data{'Accept-Language'}) {
+            $header_line .= " *";
+        }
+    }
+    if ( $data_view eq 'dg' ) {
+        $header_line = 'Destination      Gets';
+    }
+    if ( $data_view eq 'dh' ) {
+        $header_line = 'Destination      Hosts';
+        if ($Non_Compliant_Data{'Host'}) {
+            $header_line .= " *";
+        }
+    }
+    if ( $data_view eq 'dp' ) {
+        $header_line = 'Destination      PPS';
+    }
+    if ( $data_view eq 'dr' ) {
+        $header_line = 'Destination      Referers';
+        if ($Non_Compliant_Data{'Referer'}) {
+            $header_line .= " *";
+        }
+    }
+    $header_line .= " (";
+    $header_line .= scalar keys %$data_ref;
+    $header_line .= ")";
+    if ($data_view =~ /m/i) {
+        push @output_header, sprintf("%-*s", $terminal_width - 16, $header_line); 
+        my $dash_line = "-" x ($terminal_width - 11);
+        push @output_header, $dash_line;
+    } elsif ($data_view eq 'o') {
+        push @output_header, sprintf("%-*s", $terminal_width - 16, $header_line); 
+        my $dash_line = "-" x ($terminal_width - 2);
+        push @output_header, $dash_line;
+    } else {
+        push @output_header, sprintf("%-*s   Count      %", $terminal_width - 16, $header_line); 
+        my $dash_line = "-" x ($terminal_width - 15) . "  " . "-----  -----";
+        push @output_header, $dash_line;
+    }
+    return @output_header;
+}
+
+sub set_data_ref {
+    my $data_view = shift;
+    my $data_ref;
+    $data_ref = \%Src_BPS           if $data_view eq 'sb';
+    $data_ref = \%Dst_BPS           if $data_view eq 'db';
+    $data_ref = \%Src_PPS           if $data_view eq 'sp';
+    $data_ref = \%Dst_PPS           if $data_view eq 'dp';
+    $data_ref = \%Src_Data          if $data_view eq 's';
+    $data_ref = \%Dst_Data          if $data_view eq 'd';
+    $data_ref = \%Src_Dst_Data      if $data_view eq 'sd';
+    $data_ref = \%Get_Data          if $data_view eq 'g';
+    $data_ref = \%GeoIP_Data        if $data_view eq 'e';
+    $data_ref = \%Src_Get_Data      if $data_view eq 'sg';
+    $data_ref = \%Dst_Get_Data      if $data_view eq 'dg';
+    $data_ref = \%Host_Data         if $data_view eq 'h';
+    $data_ref = \%Src_Host_Data     if $data_view eq 'sh';
+    $data_ref = \%Dst_Host_Data     if $data_view eq 'dh';
+    $data_ref = \%AS_Data           if $data_view eq 'n';
+    $data_ref = \%Referer_Data      if $data_view eq 'r';
+    $data_ref = \%Src_Referer_Data  if $data_view eq 'sr';
+    $data_ref = \%Dst_Referer_Data  if $data_view eq 'dr';
+    $data_ref = \%Agent_Data        if $data_view eq 'a';
+    $data_ref = \%Src_Agent_Data    if $data_view eq 'sa';
+    $data_ref = \%Dst_Agent_Data    if $data_view eq 'da';
+    $data_ref = \%Language_Data     if $data_view eq 'l';
+    $data_ref = \%Src_Language_Data if $data_view eq 'sl';
+    $data_ref = \%Dst_Language_Data if $data_view eq 'dl';
+    $data_ref = \%Heatmap_PPS       if $data_view eq 'm';
+    $data_ref = \%Heatmap_BPS       if $data_view eq 'sm';
+
+    return $data_ref;
+}
+
+sub view_command_help {
+    print "$0 command-line options:\n";
+    print "\nInput:\n";
+    print "  interface-name          : read a live interface (will need privileged access)\n";
+    print "  -i=interface-name       : same as -i\n";
+    print "  -i=/file/name           : read a packet-capture file\n";
+    print "  -m file1 file2 ...      : read multiple files\n";
+    print "\nOutput:\n";
+    print "  -o                      : output to STDOUT (as opposed to live interface)\n";
+    print "  -o=file                 : output to file\n";
+    print "  -of=output-view(s)      : what views to output (STDOUT/file options)\n";
+    print "  -v=view-name            : live view mode; default to host\n";
+    print "\nWhat to view:\n";
+    print "   -f='BPF syntax'        : Berkeley Packet Filter\n";
+    print "   -b='BPF syntax'        : same as -f, for those familiar with dnstop\n";
+    print "   -F='HTTP header regex' : only view if header data matches regex\n";
+    print "\nHow much to view:\n";
+    print "   -c=packet-count        : view a defined count of packets (### | ###k | ###M)\n";
+    print "   -t=duration            : view for a defined amount of time (### | ###m | ###h)\n";
+    print "\nHow often to view:\n";
+    print "   -r=###                 : refresh rate; default 1 second\n";
+    print "\nAdministration:\n";
+    print "  --clear                 : clear DBM files\n";
+    return;
+}
+
+sub view_help {
+    print "Field            Aggregated    By Source IP  By Destination IP\n";
+    print "UserAgent                 a               A             Ctrl-A\n";
+    print "BPS                                       b                  B\n";
+    print "Dst IP                    d               D                   \n";
+    print "GeoIP                     e                                   \n";
+    print "GET                       g               G             Ctrl-G\n";
+    print "Host                      h               H             Ctrl-H\n";
+    print "AS Path                   n                                   \n";
+    print "Language                  l               L             Ctrl-L\n";
+    print "PPS                                       p                  P\n";
+    print "Referer                   r               R             Ctrl-R\n";
+    print "Src IP                    s                                   \n";
+    print "Src IP Heatmap BPS        m                                   \n";
+    print "Src IP Heatmap PPS        M                                   \n";
+    print "\n";
+
+    print "f       - Change BPF filter\n";
+    print "F       - Change HTTP filter\n";
+    print "`       - Reset counters\n";
+    print "<space> - pause on/off\n";
+    print "o       - overview mode\n\n";
+    print "q       - quit\n";
+    print "\nPress RETURN to continue...";
+    ReadMode 0;
+    $return = <STDIN>;
+    ReadMode 3;
+    return;
+}
+
+sub clear_bps_pps_data {
+    if (! -d "$ENV{'HOME'}/.webtop") {
+        mkdir "$ENV{'HOME'}/.webtop" or die;
+    }
+    my $current_dir = getcwd();
+    chdir("$ENV{'HOME'}/.webtop") or die;
+
+    #for my $dbm_file (qw(src_bps dst_bps src_pps dst_pps heatmap_bps heatmap_pps)) {
+    for my $dbm_file (qw(src_bps dst_bps src_pps dst_pps)) {
+        unlink($dbm_file) if -f $dbm_file;
+    }
+
+    dbmopen %Src_BPS,           'src_bps',           0644;
+    dbmopen %Dst_BPS,           'dst_bps',           0644;
+    dbmopen %Src_PPS,           'src_pps',           0644;
+    dbmopen %Dst_PPS,           'dst_pps',           0644;
+#    dbmopen %Heatmap_BPS,       'heatmap_bps',       0644;
+#    dbmopen %Heatmap_PPS,       'heatmap_pps',       0644;
+
+    chdir($current_dir);
+    return;
+}
+
+sub clear_DBM_data_files {
+
+    # create admin directory for DBM files
+    if (! -d "$ENV{'HOME'}/.webtop") {
+        mkdir "$ENV{'HOME'}/.webtop" or die;
+    }
+    my $current_dir = getcwd();
+    chdir("$ENV{'HOME'}/.webtop") or die;
+
+    # clear old DBM files
+    for my $dbm_file (@dbm_files) {
+        unlink($dbm_file) if -f $dbm_file;
+    }
+
+    # create new DBM files
+    dbmopen %Src_Data,           'src_data',           0644;
+    dbmopen %Dst_Data,           'dst_data',           0644;
+    dbmopen %Src_BPS,            'src_bps',            0644;
+    dbmopen %Dst_BPS,            'dst_bps',            0644;
+    dbmopen %Src_PPS,            'src_pps',            0644;
+    dbmopen %Dst_PPS,            'dst_pps',            0644;
+    dbmopen %Host_Data,          'host_data',          0644;
+    dbmopen %GeoIP_Data,         'geoip_data',         0644;
+    dbmopen %AS_Data,            'as_data',            0644;
+    dbmopen %Get_Data,           'get_data',           0644;
+    dbmopen %Agent_Data,         'agent_data',         0644;
+    dbmopen %Language_Data,      'language_data',      0644;
+    dbmopen %Referer_Data,       'referer_data',       0644;
+    dbmopen %Src_Host_Data,      'src_host_data',      0644;
+    dbmopen %Src_Get_Data,       'src_get_data',       0644;
+    dbmopen %Src_Agent_Data,     'src_agent_data',     0644;
+    dbmopen %Src_Language_Data,  'src_language_data',  0644;
+    dbmopen %Src_Referer_Data,   'src_referer_data',   0644;
+    dbmopen %Dst_Host_Data,      'dst_host_data',      0644;
+    dbmopen %Dst_Get_Data,       'dst_get_data',       0644;
+    dbmopen %Dst_Agent_Data,     'dst_agent_data',     0644;
+    dbmopen %Dst_Language_Data,  'dst_language_data',  0644;
+    dbmopen %Dst_Referer_Data,   'dst_referer_data',   0644;
+    dbmopen %Non_Compliant_Data, 'non_compliant_data', 0644;
+    dbmopen %Heatmap_BPS,        'heatmap_bps',        0644;
+    dbmopen %Heatmap_PPS,        'heatmap_pps',        0644;
+
+    chdir($current_dir);
+    return;    
+}
+
+sub keycmd {
+
+    my $pressed_key = ReadKey(0.01);
+    # ` (backtick) = reset
+    if (ord($pressed_key) == 96) {
+        &clear_DBM_data_files();
+        $total_transaction_count = 0;
+    }
+    if ($pressed_key eq 'q') {
+        ReadMode 0;
+        exit 0;
+    }
+    if ($pressed_key =~ /[adeghlmnors]/) { 
+        undef $command_hashref; 
+        $command_hashref->{$pressed_key}++; 
+    }
+    if ($pressed_key =~ /[AbDGHLMpR]/)  { 
+        undef $command_hashref; 
+        $command_key = 's' . lc($pressed_key); 
+        $command_hashref->{$command_key}++; 
+    }
+    if ($pressed_key =~ /[BP]/)  { 
+        undef $command_hashref; 
+        $command_key = 'd' . lc($pressed_key); 
+        $command_hashref->{$command_key}++; 
+    }
+    if (defined ( $control_keys->{ ord($pressed_key) } )) {
+        undef $command_hashref; 
+        $command_key = 'd' . chr(96 + ord($pressed_key)); 
+        $command_hashref->{$command_key}++;
+    }
+    if ($pressed_key eq 'F') {
+        print "\n\nNew HTTP filter (was '$http_filter_option'): ";
+
+        ReadMode 0;
+        $http_filter_option = <STDIN>;
+        chomp $http_filter_option;
+        ReadMode 3;
+        
+        # reset counters
+        &clear_DBM_data_files();
+        $total_transaction_count = 0;
+    }
+    if ($pressed_key eq 'f') {
+        my $old_berkeley_filter_value = $berkeley_filter_option;
+        print "\n\nNew filter (was '$berkeley_filter_option'): ";
+
+        ReadMode 0;
+        $berkeley_filter_option = <STDIN>;
+        chomp $berkeley_filter_option;
+        ReadMode 3;
+
+        # recompile filter
+        Net::Pcap::compile(
+            $net_pcap_object, 
+            \$packet_filter, 
+            $berkeley_filter_option,
+            0, 
+            $netmask
+        ) && &revert_berkeley_packet_filter($old_berkeley_filter_value);
+        Net::Pcap::setfilter($net_pcap_object, $packet_filter) &&
+            die 'Unable to set packet capture filter';
+        # reset counters
+        &clear_DBM_data_files();
+        $total_transaction_count = 0;
+    }
+    if ($pressed_key eq ' ') {
+        print "** PAUSED ** press <space> to resume\n" unless $pause_switch;
+        $pause_switch = 1 - $pause_switch;
+    }
+    if ($pressed_key eq '?') {
+        view_help();
+    }
+    return;
+}
+
+sub revert_berkeley_packet_filter {
+    my $old_berkeley_filter_value = shift;
+    print "Unable to compile packet capture filter '$berkeley_filter_option': ";
+    print " reverting to previous value";
+    sleep 3;
+    $berkeley_filter_option = $old_berkeley_filter_value;
+    Net::Pcap::compile(
+        $net_pcap_object, 
+        \$packet_filter, 
+        $berkeley_filter_option,
+        0, 
+        $netmask
+    );
+    return;
+}
+
+sub SI_notation {
+    my $value = shift;
+    my $SI_notation;
+
+         if ($value < 10000)      { $SI_notation = sprintf("%5d",    $value);
+    } elsif ($value < 100000)     { $SI_notation = sprintf("%4.1fk", $value / 1000);
+    } elsif ($value < 1000000)    { $SI_notation = sprintf("%4dk",   $value / 1000);
+    } elsif ($value < 10000000)   { $SI_notation = sprintf("%4.2fM", $value / 1000000);
+    } elsif ($value < 100000000)  { $SI_notation = sprintf("%4.1fM", $value / 1000000);
+    } elsif ($value < 1000000000) { $SI_notation = sprintf("%4dM",   $value / 1000000);
+    }
+   
+}
+
+sub refresh_screen {
+    system("clear");
+
+    print "Transactions: $transaction_count new, ",
+          &SI_notation($total_transaction_count), " total; ",
+          "Packets: $packet_count new, ",
+          &SI_notation($total_packet_count), " total;\n";
+    print "Source: '$device_name_or_file_name'; ";
+    print "BPF: '$berkeley_filter_option'; " if $berkeley_filter_option;
+    print "HTTP Filter: '$http_filter_option'; " if $http_filter_option;
+    print "Time: "; 
+    if ($device_name_or_file_name =~ /^[\.\/]/) {
+        print scalar localtime($previous_packet_time_value);
+    } else {
+        print scalar localtime; 
+    }
+    print "\n\n";
+    if ($command_hashref->{'o'}) {
+        my $terminal_length = (GetTerminalSize())[1];
+        my $terminal_width  = (GetTerminalSize())[0];
+
+        my @hosts_header   = &display_header(int($terminal_width / 2) - 1, 'h');
+        my @gets_header    = &display_header(int($terminal_width / 2) - 1, 'g');
+        my @agents_header  = &display_header(int($terminal_width / 2) - 1, 'a');
+        my @referer_header = &display_header(int($terminal_width / 2) - 1, 'r');
+
+        my @hosts_array   = &output_hash(int($terminal_length / 2), int($terminal_width / 2) - 1, 'h');
+        my @gets_array    = &output_hash(int($terminal_length / 2), int($terminal_width / 2) - 1, 'g');
+        my @agents_array  = &output_hash(int($terminal_length / 2), int($terminal_width / 2) - 1, 'a');
+        my @referer_array = &output_hash(int($terminal_length / 2), int($terminal_width / 2) - 1, 'r');
+
+        my $section_length = (scalar @hosts_header > scalar @gets_header) ? scalar @hosts_header : scalar @gets_header;
+        $section_length--;
+        for (0..$section_length) {
+            printf("%-*s | %-*s\n", 
+                int($terminal_width / 2) - 2, $hosts_header[$_], 
+                int($terminal_width / 2) - 2, $gets_header[$_]);
+        }
+
+        $section_length = (scalar @hosts_array > scalar @gets_array) ? scalar @hosts_array : scalar @gets_array;
+        $section_length--;
+        for (0..$section_length) {
+            printf("%-*s | %-*s\n", 
+                int($terminal_width / 2) - 2, $hosts_array[$_], 
+                int($terminal_width / 2) - 2, $gets_array[$_]);
+        }
+
+        print "-" x ($terminal_width - 1), "\n";
+
+        $section_length = (scalar @agents_header > scalar @referer_header) ? scalar @agents_header : scalar @referer_header;
+        $section_length--;
+        for (0..$section_length) {
+            printf("%-*s | %-*s\n", 
+                int($terminal_width / 2) - 2, $agents_header[$_], 
+                int($terminal_width / 2) - 2, $referer_header[$_]);
+        }
+
+        $section_length = (scalar @agents_array > scalar @referer_array) ? scalar @agents_array : scalar @referer_array;
+        $section_length--;
+        for (0..$section_length) {
+            printf("%-*s | %-*s\n", 
+                int($terminal_width / 2) - 2, $agents_array[$_], 
+                int($terminal_width / 2) - 2, $referer_array[$_]);
+        }
+
+    } else {
+        my @output_header = &display_header;
+        my @output_array  = &output_hash;
+        print join("\n", @output_header);
+        print "\n";
+        print join("\n", @output_array);
+    }
+    $transaction_count = 0;
+    $packet_count      = 0;
+    return;
+}
+
+sub binary_search_data {
+    my ($array_ref, $target) = @_;
+    my ( $low, $high ) = ( 0, scalar @$array_ref - 1 );
+    while ( $low < $high ) {
+        last if $high == $low + 1;
+        use integer;
+        my $current = ($low + $high) / 2;
+        if ($array_ref->[$current] < $target) {
+            $low = $current + 1;
+        } else {
+            $high = $current;
+        }
+    }
+    return $low;
+}
+
+__DATA__
+
+overall view:
+
+top 5 hosts, gets, user-agents, language? (might make this configurable)
+each section will use half the screen width - 2 characters, and half the screen length - 2 lines
+
+Hosts                        User-Agents
+-----                        --------------
+1................. ## ###.#  1................. ## ###.#  
+2................. ## ###.#  2................. ## ###.#  
+3................. ## ###.#  3................. ## ###.#  
+4................. ## ###.#  4................. ## ###.#  
+5................. ## ###.#  5................. ## ###.#  
+
+GETs                         Languages
+-----                        --------------
+1................. ## ###.#  1................. ## ###.#  
+2................. ## ###.#  2................. ## ###.#  
+3................. ## ###.#  3................. ## ###.#  
+4................. ## ###.#  4................. ## ###.#  
+5................. ## ###.#  5................. ## ###.#  
+
